@@ -4,7 +4,7 @@ Tags: rest api, cache, headless, object cache, performance
 Requires at least: 6.5
 Tested up to: 7.1
 Requires PHP: 8.1
-Stable tag: 0.1.0
+Stable tag: 0.2.0
 License: GPLv2 or later
 License URI: https://www.gnu.org/licenses/gpl-2.0.html
 
@@ -17,6 +17,8 @@ Shakewell REST Cache is for headless and API-heavy sites where the same JSON is 
 * Anonymous GET requests only. Signed-in visitors, requests with an Authorization header, login and password cookies and every other HTTP method are never served from the cache and never stored.
 * Needs a persistent object cache (Redis, Memcached or similar). Without one the plugin registers nothing and changes nothing.
 * Retires every stored answer when an editor publishes, edits, unpublishes or deletes content, or changes a term, menu, attachment, a listed option, or post meta on a post they can edit. The change takes effect at the end of the request, after the whole save.
+* Serves the previous answer while one request rebuilds, so a burst after an editor's save never stampedes PHP. The previous copy is kept for a limited time only, and never for content that stopped being public.
+* Warms the cache with `wp shakewell-rest-cache warm`, one request at a time, and optionally after each change.
 * A stored answer keeps the response headers of the original, such as pagination totals and `Link`, and embedded objects when the request asked for `_embed` and listed it as a parameter.
 * Never stores errors, answers that set a cookie, or responses to requests with parameters you did not list.
 * Nothing is built in: you choose the routes, parameters, post types and options.
@@ -36,6 +38,14 @@ Each setting is a constant or an environment variable named `SHAKEWELL_REST_CACH
 * `bypass_args` (list, default `preview`, `p`, `page_id`, `s`): page query arguments with the same effect.
 * `post_types` (list, default every public post type): types whose content changes retire the cache. Add a type that is embedded in other pages without being public.
 * `options` (list, default `blogname`, `blogdescription`, `page_on_front`, `show_on_front`, `permalink_structure`, `timezone_string`, `sidebars_widgets`) and `option_prefixes` (list, default none, for example `options_`): options whose change by an editor retires the cache.
+* `max_stale` (seconds, default `ttl` plus `ttl_jitter`, 4500): how long after a change the previous answer may still be served while the new one is rebuilt. `0` turns stale serving off. The window opens at the first change and later changes do not extend it.
+* `rebuild_lock` (seconds, default 30): how long the one request that rebuilds an answer holds the lock before another may take over. The lock is released as soon as the answer is stored.
+* `hard_meta_keys` (list, default none): post meta keys that decide who may see content, for example a private flag. A change to one leaves nothing to serve stale.
+* `warm_paths` (list, default none): paths to keep warm, for example `/wp-json/shop/v1/menu`. List shared endpoints first.
+* `warm_post_types` (list, default none): when `pages` is on, the home page and the published posts of these types are warmed too, in this order of types.
+* `warm_max_seconds` (default 270) and `warm_pause_ms` (default 0): the time budget of one run, and a pause between requests.
+* `warm_base` (default `http://127.0.0.1`) and `warm_headers` (map, default none): where the warmer sends requests, and extra headers, for example a header naming the public host a proxy would set.
+* `warm_after_change` (true or false, default false) and `warm_delay` (seconds, default 30): queue one wp-cron warm shortly after a change. Needs wp-cron to run; a system timer calling the command works without it.
 * `ttl` (seconds, default 3600) and `ttl_jitter` (seconds added at random, default 900).
 * `header` (default `X-Shakewell-Rest-Cache`): name of the HIT or MISS response header.
 * `early` (true or false, default false): send a stored answer while the plugin loads, before the theme and most plugins run. It follows the REST base path, including a subdirectory install and a changed `rest_url_prefix` (hook that filter before this plugin loads); a `?rest_route=` request takes the normal path. Filters hooked after the plugin loads do not apply to that early check; use constants or environment variables, or hook from a must-use plugin.
@@ -47,13 +57,31 @@ Each setting is a constant or an environment variable named `SHAKEWELL_REST_CACH
 * `shakewell_rest_cache_page_cacheable` (bool, array decoded, string body): refuse to store a page answer.
 * `shakewell_rest_cache_entry_ttl` (int, string kind, mixed payload): change the life of one entry, for example a shorter life for a page that shows the time.
 * `shakewell_rest_cache_hit_headers` (action): add headers to an early answer, which ends before WordPress sends its own.
-* `shakewell_rest_cache_invalidated` (action, array reasons): runs after the generation moves.
+* `shakewell_rest_cache_invalidated` (action, array reasons, bool hard): runs after the generation moves. `hard` is true when nothing is served stale.
+* `shakewell_rest_cache_warm_list` (filter, array of paths): change the final list of paths to warm, for example to add pages found by the site's own query.
 
 Keys also carry the site's date, so a page that says "today" is rebuilt after midnight.
 
+= Stale answers and what ends them =
+
+After a change, a request that finds no answer for the new generation takes a short lock in the object cache and rebuilds it. Other requests for the same URL in the meantime get the previous answer, with the header value `STALE`, and run no PHP. The previous answer is never served when the change:
+
+* took content out of publish (draft, private, pending, trash) or deleted it, or deleted an attachment;
+* gave a published post a password, a new slug or a new parent;
+* changed a meta key listed in `hard_meta_keys`;
+* is a flush, or the answer is older than `max_stale`;
+* touched that page: a page whose post was edited is always built fresh.
+
+Entries are keyed by the site's date, so nothing is served stale across midnight.
+
+= The warmer =
+
+`wp shakewell-rest-cache warm` requests each path that has no stored answer, one at a time, straight to the web server on the same instance (`warm_base`), and sends a per-run token so its requests build fresh rather than be answered stale. One warmer runs across all instances (a lock in the object cache). It stops when its time budget ends or when a change retires the generation it is building, and a run that finishes closes the stale window. A path that answered but was not stored is not retried until the next generation or hour. Running it again only requests what is still cold. Options: `--max-seconds`, `--pause-ms`, `--dry-run` (list what would be requested and change nothing) and `--quiet-if-idle`.
+
 = WP-CLI =
 
-* `wp shakewell-rest-cache flush` retires every stored answer. Run it on release.
+* `wp shakewell-rest-cache flush` retires every stored answer, with nothing served stale. Run it on release.
+* `wp shakewell-rest-cache warm` warms the cache, as above.
 * `wp shakewell-rest-cache status` shows whether the cache is active and the current generation.
 
 = External services =
@@ -81,6 +109,11 @@ No. A signed-in user, a request with an Authorization header or a login cookie, 
 Please do not open a public issue. Follow SECURITY.md in the plugin's repository.
 
 == Changelog ==
+
+= 0.2.0 =
+* Stale-while-rebuild: one request rebuilds under a short lock while others are served the previous answer, for a limited time and never for content that stopped being public.
+* `wp shakewell-rest-cache warm`, with `--dry-run`, a time budget and a fleet-wide lock, and an optional warm after each change.
+* Content that gains a password or changes address, and meta keys named in `hard_meta_keys`, leave nothing to serve stale.
 
 = 0.1.0 =
 * First release.

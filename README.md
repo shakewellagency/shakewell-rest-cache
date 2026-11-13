@@ -10,6 +10,8 @@ Free, GPL-2.0-or-later WordPress plugin for headless and API-heavy sites. It kee
 - **Anonymous GET only.** Signed-in visitors, requests with an Authorization header, login or password cookies, and any non-GET request are never served from the cache and never stored.
 - **Does nothing without a persistent object cache** (Redis, Memcached or similar). It registers no hooks in that case.
 - **Correct invalidation.** Publishing, editing, unpublishing or deleting content, term, menu, attachment, meta and listed option changes by an editor move a generation on at shutdown, after the whole save, so a half-saved post is never stored. Anonymous requests, scheduled jobs and drafts do not retire it. Every key carries the generation and the site's date.
+- **Stale while rebuilding.** After a change one request rebuilds under a short lock while the rest get the previous answer, within `max_stale` and never for content that stopped being public.
+- **A warmer.** `wp shakewell-rest-cache warm` fills what is cold, one request at a time, with a fleet-wide lock and a time budget. It can also run after each change.
 - **A generic preview bypass.** Name a request header, cookie prefix or query argument and any request carrying it skips the cache completely, so a draft preview never shows a published copy.
 - **Optional early answers.** With `SHAKEWELL_REST_CACHE_EARLY` on, a stored answer is sent as the plugin loads, before the theme and most plugins run.
 - **Honest headers.** A stored answer carries `X-Shakewell-Rest-Cache: HIT` or `MISS` (the header name is a setting). Bodies are the route's own data.

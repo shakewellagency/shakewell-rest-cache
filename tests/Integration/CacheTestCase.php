@@ -10,6 +10,7 @@ namespace Shakewell\RestCache\Tests;
 use Shakewell\RestCache\Cache;
 use Shakewell\RestCache\Invalidation;
 use Shakewell\RestCache\Plugin;
+use Shakewell\RestCache\State;
 use WP_REST_Request;
 use WP_UnitTestCase;
 
@@ -44,6 +45,17 @@ abstract class CacheTestCase extends WP_UnitTestCase {
 		'entry_ttl',
 		'page_cacheable',
 		'invalidated',
+		'max_stale',
+		'rebuild_lock',
+		'hard_meta_keys',
+		'warm_paths',
+		'warm_list',
+		'warm_post_types',
+		'warm_max_seconds',
+		'warm_pause_ms',
+		'warm_after_change',
+		'warm_delay',
+		'warm_headers',
 	);
 
 	public function set_up(): void {
@@ -66,7 +78,7 @@ abstract class CacheTestCase extends WP_UnitTestCase {
 		foreach ( self::SETTINGS as $name ) {
 			remove_all_filters( 'shakewell_rest_cache_' . $name );
 		}
-		unset( $_SERVER['HTTP_X_PREVIEW'], $_COOKIE['wordpress_logged_in_x'], $_GET['preview'], $_GET['page'], $_SERVER['REQUEST_URI'] );
+		unset( $_SERVER['HTTP_X_SHAKEWELL_REST_CACHE_WARM'], $_SERVER['REMOTE_ADDR'], $_SERVER['HTTP_X_PREVIEW'], $_COOKIE['wordpress_logged_in_x'], $_GET['preview'], $_GET['page'], $_SERVER['REQUEST_URI'] );
 		wp_using_ext_object_cache( false );
 		parent::tear_down();
 	}
@@ -114,6 +126,7 @@ abstract class CacheTestCase extends WP_UnitTestCase {
 	 * @param string              $method HTTP method.
 	 */
 	protected function request( string $route, array $params = array(), string $method = 'GET' ): \WP_REST_Response {
+		State::forget_claims();
 		$request = new WP_REST_Request( $method, $route );
 		$request->set_query_params( $params );
 		// rest_do_request() skips rest_post_dispatch, which only WP_REST_Server::serve_request() applies, so do what it does.
@@ -153,7 +166,7 @@ abstract class CacheTestCase extends WP_UnitTestCase {
 	 * The current generation.
 	 */
 	protected function generation(): string {
-		return Cache::generation();
+		return State::generation();
 	}
 
 	/**

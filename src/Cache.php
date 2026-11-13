@@ -1,6 +1,6 @@
 <?php
 /**
- * Keys, the generation that invalidates them, and reading and storing answers.
+ * Keys, and reading and storing answers.
  *
  * @package Shakewell\RestCache
  */
@@ -15,8 +15,7 @@ defined( 'ABSPATH' ) || exit;
  */
 final class Cache {
 
-	const GROUP   = 'shakewell_rest_cache';
-	const DURABLE = 'shakewell_rest_cache_generation';
+	const GROUP = 'shakewell_rest_cache';
 
 	/**
 	 * Query parameters that never change an answer, so they are dropped from the key.
@@ -67,53 +66,6 @@ final class Cache {
 		return function_exists( 'wp_using_ext_object_cache' ) && wp_using_ext_object_cache();
 	}
 
-	/* ------------------------------------------------------------ generation */
-
-	/**
-	 * The current generation, created on first use.
-	 */
-	public static function generation(): string {
-		$generation = self::read_generation();
-		if ( null === $generation ) {
-			$generation = wp_generate_uuid4();
-			if ( wp_cache_add( 'generation', $generation, self::GROUP ) ) {
-				update_option( self::DURABLE, $generation, false );
-			} else {
-				$generation = (string) wp_cache_get( 'generation', self::GROUP, true );
-			}
-		}
-		return $generation;
-	}
-
-	/**
-	 * Starts a new generation: every stored answer stops being served.
-	 */
-	public static function bump(): void {
-		$generation = wp_generate_uuid4();
-		wp_cache_set( 'generation', $generation, self::GROUP );
-		update_option( self::DURABLE, $generation, false );
-	}
-
-	/**
-	 * The generation from the object cache, forced past the in-process copy so a long-running worker
-	 * sees an editor's change. Kept in an option too: an object cache that evicts it would otherwise
-	 * drop every stored answer at once.
-	 */
-	private static function read_generation(): ?string {
-		$value = wp_cache_get( 'generation', self::GROUP, true );
-		if ( is_string( $value ) && '' !== $value ) {
-			return $value;
-		}
-		global $wpdb;
-		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- must bypass the options cache, which is the cache being rebuilt.
-		$durable = $wpdb->get_var( $wpdb->prepare( "SELECT option_value FROM {$wpdb->options} WHERE option_name = %s", self::DURABLE ) );
-		if ( ! is_string( $durable ) || '' === $durable ) {
-			return null;
-		}
-		wp_cache_add( 'generation', $durable, self::GROUP );
-		return $durable;
-	}
-
 	/* ------------------------------------------------------------------ keys */
 
 	/**
@@ -124,18 +76,19 @@ final class Cache {
 	 * @param string|null $generation Defaults to the current one.
 	 */
 	public static function key( string $kind, string $identity, ?string $generation = null ): string {
-		return $kind . ':' . md5( ( $generation ?? self::generation() ) . '|' . wp_date( 'Y-m-d' ) . '|' . $identity );
+		return $kind . ':' . md5( ( $generation ?? State::generation() ) . '|' . wp_date( 'Y-m-d' ) . '|' . $identity );
 	}
 
 	/**
 	 * The cache key for a REST route and its query parameters.
 	 *
 	 * @param string              $route  Route such as /books/v1/list.
-	 * @param array<string,mixed> $params Query parameters.
+	 * @param array<string,mixed> $params     Query parameters.
+	 * @param string|null         $generation Defaults to the current one.
 	 */
-	public static function rest_key( string $route, array $params ): string {
+	public static function rest_key( string $route, array $params, ?string $generation = null ): string {
 		ksort( $params );
-		return self::key( 'rest', $route . '?' . http_build_query( $params ) );
+		return self::key( 'rest', $route . '?' . http_build_query( $params ), $generation );
 	}
 
 	/**
@@ -268,59 +221,143 @@ final class Cache {
 		$path = (string) wp_parse_url( $uri, PHP_URL_PATH );
 		// The REST base path, so a subdirectory install or a changed rest_url_prefix still matches. The prefix
 		// filter must be hooked before this plugin loads. A ?rest_route= request takes the normal path.
-		$base = rtrim( (string) wp_parse_url( home_url( '/' . rest_get_url_prefix() ), PHP_URL_PATH ), '/' ) . '/';
+		$base = self::rest_base();
 		if ( 0 === strpos( $path, $base ) ) {
 			// A cross-origin request needs the CORS headers the REST server adds as it serves.
 			if ( ! empty( $_SERVER['HTTP_ORIGIN'] ) ) {
 				return;
 			}
-			$hit = self::lookup_rest( rtrim( substr( $path, strlen( $base ) - 1 ), '/' ), $_GET ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			$hit = self::lookup_rest( rtrim( substr( $path, strlen( $base ) - 1 ), '/' ), $_GET, 'GET' === $method ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 			if ( null !== $hit ) {
-				self::send_hit( (string) wp_json_encode( $hit['data'] ), 'application/json; charset=UTF-8', $method, $hit['headers'] );
+				self::send_hit( (string) wp_json_encode( $hit['data'] ), 'application/json; charset=UTF-8', $method, $hit['state'], $hit['headers'] );
 			}
 			return;
 		}
 
 		if ( ! self::bypassed( true ) ) {
-			$body = self::lookup_page( $uri );
-			if ( null !== $body ) {
-				self::send_hit( $body, 'application/json', $method );
+			$page = self::lookup_page( $uri, 'GET' === $method );
+			if ( null !== $page && null !== $page['body'] ) {
+				self::send_hit( $page['body'], 'application/json', $method, $page['state'] );
 			}
 		}
 	}
 
 	/**
-	 * A stored REST answer, or null.
+	 * The path REST routes are served under, with a trailing slash: /wp-json/ unless the install or prefix differs.
+	 */
+	public static function rest_base(): string {
+		return rtrim( (string) wp_parse_url( home_url( '/' . rest_get_url_prefix() ), PHP_URL_PATH ), '/' ) . '/';
+	}
+
+	/**
+	 * Whether a path the warmer requests already has a stored answer. A path that can never be cached counts
+	 * as warm only for a page; a route that is not stored is retried until the warmer marks it uncacheable.
+	 *
+	 * @param string $path Path with any query string.
+	 */
+	public static function is_warm( string $path ): bool {
+		$base = self::rest_base();
+		$bare = (string) wp_parse_url( $path, PHP_URL_PATH );
+		if ( 0 === strpos( $bare, $base ) ) {
+			parse_str( (string) wp_parse_url( $path, PHP_URL_QUERY ), $params );
+			return is_array( wp_cache_get( self::rest_key( rtrim( substr( $bare, strlen( $base ) - 1 ), '/' ), $params ), self::GROUP ) );
+		}
+		// Read only: lookup_page() may take a rebuild lock, and a status check must not.
+		$key = Config::get( 'pages', false ) ? self::page_key( $path ) : null;
+		return null === $key || is_array( wp_cache_get( $key, self::GROUP ) );
+	}
+
+	/**
+	 * A stored REST answer, or null when this request must build it. A stale answer is returned only to
+	 * requests that did not win the right to rebuild it.
 	 *
 	 * @param string              $route  REST route.
 	 * @param array<string,mixed> $params Query parameters.
-	 * @return mixed
+	 * @param bool                $claim  Whether this request would build the answer (a GET). Others are never made to wait for it.
+	 * @return array{data:mixed,headers:array<string,string>,state:string}|null
 	 */
-	public static function lookup_rest( string $route, array $params ) {
+	public static function lookup_rest( string $route, array $params, bool $claim = true ): ?array {
 		if ( ! self::is_cached_route( $route ) || ! self::route_params_allowed( $route, $params ) ) {
 			return null;
 		}
-		$cached = wp_cache_get( self::rest_key( $route, $params ), self::GROUP );
+		$key = self::rest_key( $route, $params );
+		$hit = self::read_rest( $key, 'HIT' );
+		if ( null !== $hit ) {
+			return $hit;
+		}
+		$stable = State::stale_generation();
+		$stale  = null === $stable ? null : self::read_rest( self::rest_key( $route, $params, $stable ), 'STALE' );
+		return null !== $stale && ( ! $claim || ! State::claim_rebuild( $key ) ) ? $stale : null;
+	}
+
+	/**
+	 * A stored REST entry in the shape lookup_rest() returns, or null.
+	 *
+	 * @param string $key   Cache key.
+	 * @param string $state HIT or STALE.
+	 * @return array{data:mixed,headers:array<string,string>,state:string}|null
+	 */
+	private static function read_rest( string $key, string $state ): ?array {
+		$cached = wp_cache_get( $key, self::GROUP );
 		if ( ! is_array( $cached ) || ! array_key_exists( 'data', $cached ) ) {
 			return null;
 		}
 		return array(
 			'data'    => $cached['data'],
 			'headers' => isset( $cached['headers'] ) && is_array( $cached['headers'] ) ? $cached['headers'] : array(),
+			'state'   => $state,
+		);
+	}
+
+	/**
+	 * A page request's cache key and any stored body, or null when the page must not be cached. The body is
+	 * null on a miss; a stale body is returned only to requests that did not win the right to rebuild it.
+	 *
+	 * @param string $request_uri Path with any query string.
+	 * @param bool   $claim       Whether this request would build the page (a GET). Others are never made to wait for it.
+	 * @return array{key:string,body:?string,state:string}|null
+	 */
+	public static function lookup_page( string $request_uri, bool $claim = true ): ?array {
+		$identity = Config::get( 'pages', false ) ? self::page_identity( $request_uri ) : null;
+		if ( null === $identity ) {
+			return null;
+		}
+		$key  = self::key( 'page', $identity );
+		$body = self::read_page( $key );
+		if ( null !== $body ) {
+			return array(
+				'key'   => $key,
+				'body'  => $body,
+				'state' => 'HIT',
+			);
+		}
+		$stable = State::stale_generation();
+		// A page the change touched is built fresh, never served stale; so is every page when that list is lost.
+		$fresh = null === $stable ? null : State::fresh( State::generation() );
+		if ( null !== $fresh && ! in_array( (string) strtok( $identity, '?' ), $fresh, true ) ) {
+			$body = self::read_page( self::key( 'page', $identity, $stable ) );
+			if ( null !== $body && ( ! $claim || ! State::claim_rebuild( $key ) ) ) {
+				return array(
+					'key'   => $key,
+					'body'  => $body,
+					'state' => 'STALE',
+				);
+			}
+		}
+		return array(
+			'key'   => $key,
+			'body'  => null,
+			'state' => 'MISS',
 		);
 	}
 
 	/**
 	 * A stored page body, inflated, or null.
 	 *
-	 * @param string $request_uri Path with any query string.
+	 * @param string $key Cache key.
 	 */
-	public static function lookup_page( string $request_uri ): ?string {
-		if ( ! Config::get( 'pages', false ) ) {
-			return null;
-		}
-		$key    = self::page_key( $request_uri );
-		$stored = null === $key ? null : wp_cache_get( $key, self::GROUP );
+	private static function read_page( string $key ): ?string {
+		$stored = wp_cache_get( $key, self::GROUP );
 		if ( ! is_array( $stored ) || ! isset( $stored['z'] ) ) {
 			return null;
 		}
@@ -334,16 +371,17 @@ final class Cache {
 	 * @param string $body         Body.
 	 * @param string $content_type Content-Type.
 	 * @param string $method       GET or HEAD.
+	 * @param string $state        HIT or STALE.
 	 * @param array  $headers      Headers of the original response, such as pagination totals.
 	 */
-	private static function send_hit( string $body, string $content_type, string $method, array $headers = array() ): void {
+	private static function send_hit( string $body, string $content_type, string $method, string $state = 'HIT', array $headers = array() ): void {
 		status_header( 200 );
 		if ( ! headers_sent() ) {
 			foreach ( $headers as $name => $value ) {
 				header( $name . ': ' . $value );
 			}
 			header( 'Content-Type: ' . $content_type );
-			header( Config::get( 'header', 'X-Shakewell-Rest-Cache' ) . ': HIT' );
+			header( Config::get( 'header', 'X-Shakewell-Rest-Cache' ) . ': ' . $state );
 		}
 		// An early hit ends before wp_headers, so a site that adds headers there adds them here.
 		do_action( 'shakewell_rest_cache_hit_headers' );
@@ -366,13 +404,16 @@ final class Cache {
 		) {
 			return;
 		}
-		$uri  = self::server( 'REQUEST_URI' );
-		$body = self::lookup_page( $uri );
-		if ( null !== $body ) {
-			self::send_hit( $body, 'application/json', $method );
+		$page = self::lookup_page( self::server( 'REQUEST_URI' ), 'GET' === $method );
+		if ( null === $page ) {
+			return;
 		}
-		$key = self::page_key( $uri );
-		if ( null === $key || 'GET' !== $method ) {
+		if ( null !== $page['body'] ) {
+			self::send_hit( $page['body'], 'application/json', $method, $page['state'] );
+		}
+		// The key from before the build started, so a change that lands meanwhile cannot be stored under.
+		$key = $page['key'];
+		if ( 'GET' !== $method ) {
 			return;
 		}
 		if ( ! headers_sent() ) {
@@ -422,6 +463,7 @@ final class Cache {
 		}
 		// Compressed: payloads are large and share a small node with the object cache.
 		wp_cache_set( $key, array( 'z' => gzdeflate( $body, 6 ) ), self::GROUP, self::ttl( 'page', $body ) );
+		State::release_rebuild( $key );
 	}
 
 	/**
@@ -458,7 +500,7 @@ final class Cache {
 		// store_rest() skips any response carrying this header, so a hit is never stored again.
 		$response = new \WP_REST_Response( $hit['data'], 200 );
 		$response->set_headers( $hit['headers'] );
-		$response->header( Config::get( 'header', 'X-Shakewell-Rest-Cache' ), 'HIT' );
+		$response->header( Config::get( 'header', 'X-Shakewell-Rest-Cache' ), $hit['state'] );
 		return $response;
 	}
 
@@ -499,6 +541,7 @@ final class Cache {
 			self::GROUP,
 			self::ttl( 'rest', $data )
 		);
+		State::release_rebuild( $key );
 		$response->header( $header, 'MISS' );
 		return $response;
 	}
