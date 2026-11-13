@@ -27,10 +27,25 @@ final class Invalidation {
 	private static array $reasons = array();
 
 	/**
+	 * Page paths this request's changes touched, which are built fresh rather than served stale.
+	 *
+	 * @var string[]
+	 */
+	private static array $paths = array();
+
+	/**
+	 * Whether this request must leave nothing to serve stale.
+	 *
+	 * @var bool
+	 */
+	private static bool $hard = false;
+
+	/**
 	 * Registers the content-change hooks.
 	 */
 	public static function register(): void {
 		add_action( 'transition_post_status', array( self::class, 'on_post_transition' ), 10, 3 );
+		add_action( 'post_updated', array( self::class, 'on_post_updated' ), 10, 3 );
 		add_action( 'before_delete_post', array( self::class, 'on_post_delete' ), 10, 2 );
 		// Not edit_attachment: an upload changes nothing a visitor sees until a page uses it, and saving
 		// that page retires the cache anyway.
@@ -49,30 +64,55 @@ final class Invalidation {
 	/**
 	 * Retires the cache when this request finishes.
 	 *
-	 * @param string $reason Why, for the log.
-	 * @param string $detail Detail, for the log.
+	 * @param string        $reason Why, for the log.
+	 * @param string        $detail Detail, for the log.
+	 * @param \WP_Post|null $post   A published post the change touched: its page is built fresh, never served stale.
+	 * @param bool          $hard   True when content became non-public, was deleted, moved or renamed: nothing is served stale.
 	 */
-	public static function mark_dirty( string $reason, string $detail = '' ): void {
+	public static function mark_dirty( string $reason, string $detail = '', ?\WP_Post $post = null, bool $hard = false ): void {
 		if ( ! self::$reasons ) {
 			add_action( 'shutdown', array( self::class, 'apply' ), PHP_INT_MAX );
 		}
 		self::$reasons[ $reason ][] = $detail;
+		self::$hard                 = self::$hard || $hard;
+		$path                       = $post ? self::path_for( $post ) : null;
+		if ( null !== $path ) {
+			self::$paths[] = $path;
+		}
 	}
 
 	/**
-	 * Moves the generation on and logs the cause. Runs at shutdown.
+	 * The path of a published, viewable post, or null.
+	 *
+	 * @param \WP_Post $post Post.
+	 */
+	private static function path_for( \WP_Post $post ): ?string {
+		if ( 'publish' !== $post->post_status || ! is_post_type_viewable( $post->post_type ) ) {
+			return null;
+		}
+		$path = (string) wp_parse_url( (string) get_permalink( $post ), PHP_URL_PATH );
+		return '' === $path ? null : $path;
+	}
+
+	/**
+	 * Moves the generation on, logs the cause and queues a warm. Runs at shutdown.
 	 */
 	public static function apply(): void {
 		$reasons       = self::$reasons;
+		$paths         = array_values( array_unique( self::$paths ) );
+		$hard          = self::$hard;
 		self::$reasons = array();
+		self::$paths   = array();
+		self::$hard    = false;
 		if ( ! $reasons ) {
 			return;
 		}
-		Cache::bump();
-		do_action( 'shakewell_rest_cache_invalidated', $reasons );
+		State::bump( $paths, $hard );
+		do_action( 'shakewell_rest_cache_invalidated', $reasons, $hard );
 		if ( Config::get( 'log', false ) ) {
-			self::log( $reasons );
+			self::log( $reasons, $hard );
 		}
+		Warmer::schedule();
 	}
 
 	/**
@@ -80,8 +120,9 @@ final class Invalidation {
 	 * Details are grouped under their reason and capped; the query string is dropped, as it can carry nonces.
 	 *
 	 * @param array<string,string[]> $reasons Reason => details.
+	 * @param bool                   $hard    Whether nothing is served stale.
 	 */
-	private static function log( array $reasons ): void {
+	private static function log( array $reasons, bool $hard ): void {
 		$parts = array();
 		foreach ( $reasons as $reason => $details ) {
 			$details = array_values( array_unique( array_filter( $details, 'strlen' ) ) );
@@ -91,7 +132,8 @@ final class Invalidation {
 		$uri = explode( '?', Cache::server( 'REQUEST_URI' ), 2 )[0];
 		error_log( // phpcs:ignore WordPress.PHP.DevelopmentFunctions.error_log_error_log
 			sprintf(
-				'shakewell-rest-cache: bump by user %d via %s %s: %s',
+				'shakewell-rest-cache: %s by user %d via %s %s: %s',
+				$hard ? 'retire' : 'bump',
 				get_current_user_id(),
 				Cache::server( 'REQUEST_METHOD', 'cli' ),
 				'' !== $uri ? $uri : 'wp-cli',
@@ -150,7 +192,29 @@ final class Invalidation {
 			( 'publish' === $new_status || 'publish' === $old_status ) &&
 			! self::is_anonymous_web_request()
 		) {
-			self::mark_dirty( "post {$post->post_type} {$post->ID}", "$old_status>$new_status" );
+			// Published content appearing or changing is built fresh at once; content leaving publish must vanish at once.
+			$published = 'publish' === $new_status;
+			self::mark_dirty( "post {$post->post_type} {$post->ID}", "$old_status>$new_status", $published ? $post : null, ! $published );
+		}
+	}
+
+	/**
+	 * Published content that gains a password or changes address while it stays published. Its old address and
+	 * its old, open copy must not be served stale.
+	 *
+	 * @param int      $post_id Post id.
+	 * @param \WP_Post $after   Post after the update.
+	 * @param \WP_Post $before  Post before the update.
+	 */
+	public static function on_post_updated( $post_id, $after, $before ): void {
+		if (
+			$after instanceof \WP_Post && $before instanceof \WP_Post &&
+			'publish' === $after->post_status && 'publish' === $before->post_status &&
+			in_array( $after->post_type, self::types(), true ) &&
+			! self::is_anonymous_web_request() &&
+			( $after->post_password !== $before->post_password || $after->post_name !== $before->post_name || $after->post_parent !== $before->post_parent )
+		) {
+			self::mark_dirty( "moved or protected {$after->post_type} {$after->ID}", '', null, true );
 		}
 	}
 
@@ -163,7 +227,7 @@ final class Invalidation {
 	public static function on_post_delete( $post_id, $post = null ): void {
 		$post = $post instanceof \WP_Post ? $post : get_post( $post_id );
 		if ( self::is_public_content( $post ) && ! self::is_anonymous_web_request() ) {
-			self::mark_dirty( "delete {$post->post_type} {$post->ID}" );
+			self::mark_dirty( "delete {$post->post_type} {$post->ID}", '', null, true );
 		}
 	}
 
@@ -185,7 +249,7 @@ final class Invalidation {
 	 */
 	public static function on_attachment_delete( $post_id = null ): void {
 		if ( ! self::is_anonymous_web_request() ) {
-			self::mark_dirty( 'delete attachment', is_scalar( $post_id ) ? (string) $post_id : '' );
+			self::mark_dirty( 'delete attachment', is_scalar( $post_id ) ? (string) $post_id : '', null, true );
 		}
 	}
 
@@ -198,7 +262,7 @@ final class Invalidation {
 		if ( is_numeric( $post_id ) ) {
 			$post = get_post( (int) $post_id );
 			if ( self::is_public_content( $post ) && ! self::is_anonymous_web_request() ) {
-				self::mark_dirty( "acf {$post->post_type} {$post->ID}" );
+				self::mark_dirty( "acf {$post->post_type} {$post->ID}", '', $post );
 			}
 			return;
 		}
@@ -221,7 +285,8 @@ final class Invalidation {
 		}
 		$post = get_post( (int) $object_id );
 		if ( self::is_public_content( $post ) && current_user_can( 'edit_post', $post->ID ) ) {
-			self::mark_dirty( "meta {$post->post_type} {$post->ID}", $meta_key );
+			// A key that decides who may see the content (a private flag) leaves nothing to serve stale.
+			self::mark_dirty( "meta {$post->post_type} {$post->ID}", $meta_key, $post, in_array( $meta_key, Config::list( 'hard_meta_keys' ), true ) );
 		}
 	}
 

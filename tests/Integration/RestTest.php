@@ -8,6 +8,7 @@
 namespace Shakewell\RestCache\Tests;
 
 use Shakewell\RestCache\Cache;
+use Shakewell\RestCache\State;
 use WP_REST_Request;
 
 final class RestTest extends CacheTestCase {
@@ -34,7 +35,7 @@ final class RestTest extends CacheTestCase {
 		$request = new WP_REST_Request( 'GET', '/shop/v1/list' );
 		apply_filters( 'rest_pre_dispatch', null, $server, $request );
 		$response = $server->dispatch( $request );
-		Cache::bump(); // An editor's save finished while this request was running.
+		State::bump(); // An editor's save finished while this request was running.
 		apply_filters( 'rest_post_dispatch', $response, $server, $request );
 		$this->assertSame( 'MISS', $this->state( $this->request( '/shop/v1/list' ) ), 'the stale answer was not stored' );
 		$this->assertSame( 'HIT', $this->state( $this->request( '/shop/v1/list' ) ) );

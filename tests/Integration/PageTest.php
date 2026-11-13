@@ -19,6 +19,16 @@ final class PageTest extends CacheTestCase {
 	}
 
 	/**
+	 * The stored body for a URL, or null.
+	 *
+	 * @param string $uri Request URI.
+	 */
+	private function body( string $uri ): ?string {
+		$page = Cache::lookup_page( $uri );
+		return $page['body'] ?? null;
+	}
+
+	/**
 	 * Visits a URL through serve_page(), prints $body, and stores it as shutdown would.
 	 *
 	 * @param string   $uri     Request URI.
@@ -36,30 +46,30 @@ final class PageTest extends CacheTestCase {
 
 	public function test_a_json_page_is_stored_and_found(): void {
 		$this->visit( '/books/', '{"status":200,"title":"Books"}' );
-		$this->assertSame( '{"status":200,"title":"Books"}', Cache::lookup_page( '/books/' ) );
-		$this->assertSame( Cache::lookup_page( '/books/' ), Cache::lookup_page( '/books' ), 'a trailing slash does not matter' );
+		$this->assertSame( '{"status":200,"title":"Books"}', $this->body( '/books/' ) );
+		$this->assertSame( $this->body( '/books/' ), $this->body( '/books' ), 'a trailing slash does not matter' );
 	}
 
 	public function test_nothing_is_stored_unless_pages_are_enabled(): void {
 		remove_all_filters( 'shakewell_rest_cache_pages' );
 		$this->go_to( '/books/' );
 		Cache::serve_page();
-		$this->assertNull( Cache::lookup_page( '/books/' ) );
+		$this->assertNull( $this->body( '/books/' ) );
 	}
 
 	public function test_html_and_non_200_and_cookie_setting_answers_are_not_stored(): void {
 		$this->visit( '/html/', '{"a":1}', array( 'Content-Type: text/html' ) );
-		$this->assertNull( Cache::lookup_page( '/html/' ) );
+		$this->assertNull( $this->body( '/html/' ) );
 
 		$this->visit( '/cookie/', '{"a":1}', array( 'Content-Type: application/json', 'Set-Cookie: a=b' ) );
-		$this->assertNull( Cache::lookup_page( '/cookie/' ) );
+		$this->assertNull( $this->body( '/cookie/' ) );
 
 		$this->go_to( '/missing/' );
 		Cache::serve_page();
 		echo '{"a":1}'; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
 		Cache::store_page( self::JSON, 404 );
 		ob_end_clean();
-		$this->assertNull( Cache::lookup_page( '/missing/' ) );
+		$this->assertNull( $this->body( '/missing/' ) );
 	}
 
 	public function test_the_site_can_refuse_an_answer(): void {
@@ -71,13 +81,13 @@ final class PageTest extends CacheTestCase {
 		);
 		$this->visit( '/ok/', '{"status":200}' );
 		$this->visit( '/gone/', '{"status":404}' );
-		$this->assertNotNull( Cache::lookup_page( '/ok/' ) );
-		$this->assertNull( Cache::lookup_page( '/gone/' ) );
+		$this->assertNotNull( $this->body( '/ok/' ) );
+		$this->assertNull( $this->body( '/gone/' ) );
 	}
 
 	public function test_a_body_that_is_not_json_is_not_stored(): void {
 		$this->visit( '/broken/', '{"a":1} <b>notice</b>' );
-		$this->assertNull( Cache::lookup_page( '/broken/' ) );
+		$this->assertNull( $this->body( '/broken/' ) );
 	}
 
 	public function test_tracking_params_are_dropped_and_unknown_params_bypass(): void {
@@ -107,11 +117,11 @@ final class PageTest extends CacheTestCase {
 
 	public function test_a_change_retires_stored_pages(): void {
 		$this->visit( '/books/', '{"status":200}' );
-		$this->assertNotNull( Cache::lookup_page( '/books/' ) );
+		$this->assertNotNull( $this->body( '/books/' ) );
 		$this->sign_in();
 		update_option( 'blogname', 'x' );
 		$this->shutdown();
-		$this->assertNull( Cache::lookup_page( '/books/' ) );
+		$this->assertNull( $this->body( '/books/' ) );
 	}
 
 	public function test_a_preview_argument_or_header_is_not_buffered(): void {
