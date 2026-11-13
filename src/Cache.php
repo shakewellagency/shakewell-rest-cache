@@ -24,7 +24,7 @@ final class Cache {
 	 */
 	const TRACKING = array( 'utm_[a-z_]+', 'gclid', 'gbraid', 'wbraid', 'fbclid', 'msclkid', 'dclid', '_ga', '_gl', '_kx', 'mc_cid', 'mc_eid', 'gad_source', 'gad_campaignid', 'srsltid', 'rwg_token' );
 
-	/** A page parameter is keyed only when its value is a plain slug or number. */
+	/** A page or route parameter is keyed only when its value is a plain slug or number. */
 	const PARAM_VALUE = '/^[\w,-]{0,64}$/';
 
 	/**
@@ -33,6 +33,13 @@ final class Cache {
 	 * @var string|null
 	 */
 	private static ?string $page_key = null;
+
+	/**
+	 * Cache keys of the REST requests in flight, computed before they were dispatched.
+	 *
+	 * @var \WeakMap|null
+	 */
+	private static ?\WeakMap $rest_keys = null;
 
 	/**
 	 * Output buffer level opened for it.
@@ -142,8 +149,9 @@ final class Cache {
 	}
 
 	/**
-	 * Whether a request for a cached route carries only parameters that route takes. Without this,
-	 * /route?x=<random> would store a new entry per request and fill the shared cache.
+	 * Whether a request for a cached route carries only parameters that route takes, with plain values
+	 * (letters, digits, underscore, comma, hyphen, up to 64 characters). Without this, /route?x=<random>
+	 * would store a new entry per request and fill the shared cache.
 	 *
 	 * @param string              $route  REST route.
 	 * @param array<string,mixed> $params Query parameters.
@@ -152,7 +160,7 @@ final class Cache {
 		$map     = Config::get( 'route_params', array() );
 		$allowed = isset( $map[ $route ] ) && is_array( $map[ $route ] ) ? $map[ $route ] : array();
 		foreach ( $params as $name => $value ) {
-			if ( ! in_array( (string) $name, $allowed, true ) || ! is_scalar( $value ) ) {
+			if ( ! in_array( (string) $name, $allowed, true ) || ! is_scalar( $value ) || ! preg_match( self::PARAM_VALUE, (string) $value ) ) {
 				return false;
 			}
 		}
@@ -218,7 +226,8 @@ final class Cache {
 	 * @param bool $page True for a front-end page request, false for REST.
 	 */
 	public static function bypassed( bool $page ): bool {
-		$bypass = ! empty( $_SERVER['HTTP_AUTHORIZATION'] );
+		// The header reaches PHP under different names on CGI and FastCGI; core reads all three for application passwords.
+		$bypass = ! empty( $_SERVER['HTTP_AUTHORIZATION'] ) || ! empty( $_SERVER['REDIRECT_HTTP_AUTHORIZATION'] ) || ! empty( $_SERVER['PHP_AUTH_USER'] );
 		foreach ( Config::list( 'bypass_headers' ) as $header ) {
 			$bypass = $bypass || ! empty( $_SERVER[ 'HTTP_' . strtoupper( str_replace( '-', '_', $header ) ) ] );
 		}
@@ -257,14 +266,17 @@ final class Cache {
 
 		$uri  = self::server( 'REQUEST_URI' );
 		$path = (string) wp_parse_url( $uri, PHP_URL_PATH );
-		if ( 0 === strpos( $path, '/wp-json/' ) ) {
+		// The REST base path, so a subdirectory install or a changed rest_url_prefix still matches. The prefix
+		// filter must be hooked before this plugin loads. A ?rest_route= request takes the normal path.
+		$base = rtrim( (string) wp_parse_url( home_url( '/' . rest_get_url_prefix() ), PHP_URL_PATH ), '/' ) . '/';
+		if ( 0 === strpos( $path, $base ) ) {
 			// A cross-origin request needs the CORS headers the REST server adds as it serves.
 			if ( ! empty( $_SERVER['HTTP_ORIGIN'] ) ) {
 				return;
 			}
-			$hit = self::lookup_rest( rtrim( substr( $path, strlen( '/wp-json' ) ), '/' ), $_GET ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			$hit = self::lookup_rest( rtrim( substr( $path, strlen( $base ) - 1 ), '/' ), $_GET ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 			if ( null !== $hit ) {
-				self::send_hit( (string) wp_json_encode( $hit ), 'application/json; charset=UTF-8', $method );
+				self::send_hit( (string) wp_json_encode( $hit['data'] ), 'application/json; charset=UTF-8', $method, $hit['headers'] );
 			}
 			return;
 		}
@@ -289,7 +301,13 @@ final class Cache {
 			return null;
 		}
 		$cached = wp_cache_get( self::rest_key( $route, $params ), self::GROUP );
-		return is_array( $cached ) && array_key_exists( 'data', $cached ) ? $cached['data'] : null;
+		if ( ! is_array( $cached ) || ! array_key_exists( 'data', $cached ) ) {
+			return null;
+		}
+		return array(
+			'data'    => $cached['data'],
+			'headers' => isset( $cached['headers'] ) && is_array( $cached['headers'] ) ? $cached['headers'] : array(),
+		);
 	}
 
 	/**
@@ -316,10 +334,14 @@ final class Cache {
 	 * @param string $body         Body.
 	 * @param string $content_type Content-Type.
 	 * @param string $method       GET or HEAD.
+	 * @param array  $headers      Headers of the original response, such as pagination totals.
 	 */
-	private static function send_hit( string $body, string $content_type, string $method ): void {
+	private static function send_hit( string $body, string $content_type, string $method, array $headers = array() ): void {
 		status_header( 200 );
 		if ( ! headers_sent() ) {
+			foreach ( $headers as $name => $value ) {
+				header( $name . ': ' . $value );
+			}
 			header( 'Content-Type: ' . $content_type );
 			header( Config::get( 'header', 'X-Shakewell-Rest-Cache' ) . ': HIT' );
 		}
@@ -425,12 +447,17 @@ final class Cache {
 		if ( null !== $result || ! $request instanceof \WP_REST_Request || 'GET' !== $request->get_method() || is_user_logged_in() || self::bypassed( false ) ) {
 			return $result;
 		}
-		$data = self::lookup_rest( $request->get_route(), $request->get_query_params() );
-		if ( null === $data ) {
+		// On a miss, keep the key now. It must not be computed again when the answer is stored: a request that
+		// began before an editor's save and ends after the generation moved would store its stale answer under the new one.
+		self::$rest_keys           ??= new \WeakMap();
+		self::$rest_keys[ $request ] = self::rest_key( $request->get_route(), $request->get_query_params() );
+		$hit                         = self::lookup_rest( $request->get_route(), $request->get_query_params() );
+		if ( null === $hit ) {
 			return $result;
 		}
 		// store_rest() skips any response carrying this header, so a hit is never stored again.
-		$response = new \WP_REST_Response( $data, 200 );
+		$response = new \WP_REST_Response( $hit['data'], 200 );
+		$response->set_headers( $hit['headers'] );
 		$response->header( Config::get( 'header', 'X-Shakewell-Rest-Cache' ), 'HIT' );
 		return $response;
 	}
@@ -445,9 +472,10 @@ final class Cache {
 	 */
 	public static function store_rest( $response, $server, $request ) {
 		$header = Config::get( 'header', 'X-Shakewell-Rest-Cache' );
+		$key    = $request instanceof \WP_REST_Request ? ( self::$rest_keys[ $request ] ?? null ) : null;
 		if (
+			null === $key ||
 			! $response instanceof \WP_REST_Response ||
-			! $request instanceof \WP_REST_Request ||
 			'GET' !== $request->get_method() ||
 			200 !== $response->get_status() ||
 			isset( $response->get_headers()[ $header ] ) ||
@@ -457,9 +485,20 @@ final class Cache {
 		) {
 			return $response;
 		}
-		// Stored as the JSON-ready array so nothing live (a WP_Post, a closure) is serialised.
-		$data = $server->response_to_data( $response, false );
-		wp_cache_set( self::rest_key( $request->get_route(), $request->get_query_params() ), array( 'data' => $data ), self::GROUP, self::ttl( 'rest', $data ) );
+		// Stored as the JSON-ready array so nothing live (a WP_Post, a closure) is serialised. Embedded
+		// objects are included when the request asked for them, as WP_REST_Server::serve_request() does.
+		$embed   = $request->has_param( '_embed' ) ? rest_parse_embed_param( $request->get_param( '_embed' ) ) : false;
+		$data    = $server->response_to_data( $response, $embed );
+		$headers = array_diff_key( $response->get_headers(), array( $header => 1 ) );
+		wp_cache_set(
+			$key,
+			array(
+				'data'    => $data,
+				'headers' => $headers,
+			),
+			self::GROUP,
+			self::ttl( 'rest', $data )
+		);
 		$response->header( $header, 'MISS' );
 		return $response;
 	}

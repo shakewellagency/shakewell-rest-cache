@@ -206,8 +206,9 @@ final class Invalidation {
 	}
 
 	/**
-	 * Meta written by an editor. Scheduled jobs and WP-CLI are ignored: the time to live already bounds how
-	 * stale their data can be. So are drafts, autosaves and revisions, which cannot change a stored answer.
+	 * Meta written by someone who can edit the post. Scheduled jobs and WP-CLI are ignored: the time to live
+	 * already bounds how stale their data can be. So are drafts, autosaves and revisions, which cannot change
+	 * a stored answer, and meta a member writes on a post they cannot edit, such as a view counter.
 	 *
 	 * @param int    $meta_id   Meta id.
 	 * @param int    $object_id Post id.
@@ -219,7 +220,7 @@ final class Invalidation {
 			return;
 		}
 		$post = get_post( (int) $object_id );
-		if ( self::is_public_content( $post ) ) {
+		if ( self::is_public_content( $post ) && current_user_can( 'edit_post', $post->ID ) ) {
 			self::mark_dirty( "meta {$post->post_type} {$post->ID}", $meta_key );
 		}
 	}

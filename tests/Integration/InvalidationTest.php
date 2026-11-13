@@ -109,6 +109,13 @@ final class InvalidationTest extends CacheTestCase {
 		$this->assertKeeps( fn() => update_post_meta( $draft, 'colour', 'red' ) );
 	}
 
+	public function test_meta_a_member_writes_on_a_post_they_cannot_edit_keeps_the_cache(): void {
+		$id = self::factory()->post->create( array( 'post_status' => 'publish' ) );
+		$this->shutdown();
+		wp_set_current_user( self::factory()->user->create( array( 'role' => 'subscriber' ) ) );
+		$this->assertKeeps( fn() => update_post_meta( $id, 'views', '10' ) );
+	}
+
 	public function test_meta_written_outside_an_editor_session_keeps_the_cache(): void {
 		$id = self::factory()->post->create( array( 'post_status' => 'publish' ) );
 		$this->shutdown();

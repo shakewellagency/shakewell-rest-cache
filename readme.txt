@@ -16,7 +16,8 @@ Shakewell REST Cache is for headless and API-heavy sites where the same JSON is 
 
 * Anonymous GET requests only. Signed-in visitors, requests with an Authorization header, login and password cookies and every other HTTP method are never served from the cache and never stored.
 * Needs a persistent object cache (Redis, Memcached or similar). Without one the plugin registers nothing and changes nothing.
-* Retires every stored answer when an editor publishes, edits, unpublishes or deletes content, or changes a term, menu, attachment, post meta or a listed option. The change takes effect at the end of the request, after the whole save.
+* Retires every stored answer when an editor publishes, edits, unpublishes or deletes content, or changes a term, menu, attachment, a listed option, or post meta on a post they can edit. The change takes effect at the end of the request, after the whole save.
+* A stored answer keeps the response headers of the original, such as pagination totals and `Link`, and embedded objects when the request asked for `_embed` and listed it as a parameter.
 * Never stores errors, answers that set a cookie, or responses to requests with parameters you did not list.
 * Nothing is built in: you choose the routes, parameters, post types and options.
 
@@ -25,7 +26,7 @@ Shakewell REST Cache is for headless and API-heavy sites where the same JSON is 
 Each setting is a constant or an environment variable named `SHAKEWELL_REST_CACHE_<NAME>` in upper case, and a filter named `shakewell_rest_cache_<name>` in lower case. A constant wins over an environment variable. Lists and maps are PHP arrays in a constant, or in an environment variable a JSON value or (lists only) a comma-separated list. Use JSON when a value contains a comma, such as a regular expression with `{1,3}`.
 
 * `routes` (list of regular expressions, default none): REST routes to cache, each matched against the whole route such as `/shop/v1/books`.
-* `route_params` (map of route to list, default none): query parameters each cached route accepts. A request with any other parameter bypasses the cache, so random parameters cannot fill it.
+* `route_params` (map of route to list, default none): query parameters each cached route accepts. A request with any other parameter, or a value that is not a plain slug or number (letters, digits, underscore, comma, hyphen, up to 64 characters), bypasses the cache, so random parameters cannot fill it. A route that takes free text, such as a search, is therefore never cached.
 * `pages` (true or false, default false): also cache front-end pages whose response is JSON.
 * `page_params` (list, default `page`, `paged`): query parameters that change a page. Only plain slugs and numbers up to 64 characters are keyed; anything else bypasses.
 * `ignored_params` (list of regular expressions, default common analytics parameters): dropped from a page key.
@@ -37,7 +38,7 @@ Each setting is a constant or an environment variable named `SHAKEWELL_REST_CACH
 * `options` (list, default `blogname`, `blogdescription`, `page_on_front`, `show_on_front`, `permalink_structure`, `timezone_string`, `sidebars_widgets`) and `option_prefixes` (list, default none, for example `options_`): options whose change by an editor retires the cache.
 * `ttl` (seconds, default 3600) and `ttl_jitter` (seconds added at random, default 900).
 * `header` (default `X-Shakewell-Rest-Cache`): name of the HIT or MISS response header.
-* `early` (true or false, default false): send a stored answer while the plugin loads, before the theme and most plugins run. Filters hooked after the plugin loads do not apply to that early check; use constants or environment variables, or hook from a must-use plugin.
+* `early` (true or false, default false): send a stored answer while the plugin loads, before the theme and most plugins run. It follows the REST base path, including a subdirectory install and a changed `rest_url_prefix` (hook that filter before this plugin loads); a `?rest_route=` request takes the normal path. Filters hooked after the plugin loads do not apply to that early check; use constants or environment variables, or hook from a must-use plugin.
 * `log` (true or false, default false): one error log line for each request that retires the cache, with the reasons.
 
 = Filters and actions =

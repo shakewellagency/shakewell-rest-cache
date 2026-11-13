@@ -8,6 +8,7 @@
 namespace Shakewell\RestCache\Tests;
 
 use Shakewell\RestCache\Cache;
+use WP_REST_Request;
 
 final class RestTest extends CacheTestCase {
 
@@ -19,6 +20,32 @@ final class RestTest extends CacheTestCase {
 		$this->assertSame( 1, $this->calls );
 		$this->assertSame( $first->get_data(), $second->get_data() );
 		$this->assertSame( 200, $second->get_status() );
+	}
+
+	public function test_a_hit_keeps_the_headers_of_the_original_response(): void {
+		$this->request( '/shop/v1/list' );
+		$hit = $this->request( '/shop/v1/list' );
+		$this->assertSame( 'HIT', $this->state( $hit ) );
+		$this->assertSame( '5', $hit->get_headers()['X-Total'] );
+	}
+
+	public function test_an_answer_that_finishes_after_a_change_is_not_stored_under_the_new_generation(): void {
+		$server  = rest_get_server();
+		$request = new WP_REST_Request( 'GET', '/shop/v1/list' );
+		apply_filters( 'rest_pre_dispatch', null, $server, $request );
+		$response = $server->dispatch( $request );
+		Cache::bump(); // An editor's save finished while this request was running.
+		apply_filters( 'rest_post_dispatch', $response, $server, $request );
+		$this->assertSame( 'MISS', $this->state( $this->request( '/shop/v1/list' ) ), 'the stale answer was not stored' );
+		$this->assertSame( 'HIT', $this->state( $this->request( '/shop/v1/list' ) ) );
+	}
+
+	public function test_a_value_that_is_not_a_plain_slug_bypasses_the_cache(): void {
+		$this->request( '/shop/v1/list', array( 'page' => 'a b' ) );
+		$this->assertNull( $this->state( $this->request( '/shop/v1/list', array( 'page' => 'a b' ) ) ) );
+		$this->request( '/shop/v1/list', array( 'page' => str_repeat( '1', 65 ) ) );
+		$this->assertNull( $this->state( $this->request( '/shop/v1/list', array( 'page' => str_repeat( '1', 65 ) ) ) ) );
+		$this->assertSame( 4, $this->calls );
 	}
 
 	public function test_a_route_matches_whole_and_unlisted_routes_are_untouched(): void {

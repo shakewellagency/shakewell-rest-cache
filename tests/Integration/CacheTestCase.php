@@ -77,10 +77,14 @@ abstract class CacheTestCase extends WP_UnitTestCase {
 	public function register_routes(): void {
 		$callback = function ( WP_REST_Request $request ) {
 			++$this->calls;
-			return array(
-				'n'    => $this->calls,
-				'page' => $request->get_param( 'page' ),
+			$response = new \WP_REST_Response(
+				array(
+					'n'    => $this->calls,
+					'page' => $request->get_param( 'page' ),
+				)
 			);
+			$response->header( 'X-Total', '5' );
+			return $response;
 		};
 		foreach ( array( '/shop/v1/list', '/shop/v1/item', '/shop/v1/private' ) as $route ) {
 			register_rest_route(

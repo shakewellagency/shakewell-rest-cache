@@ -53,4 +53,13 @@ final class BypassTest extends CacheTestCase {
 		$this->assertNull( $this->state( $this->request( '/shop/v1/list' ) ) );
 		unset( $_SERVER['HTTP_AUTHORIZATION'] );
 	}
+
+	public function test_the_other_names_the_authorization_header_arrives_under_skip_the_cache(): void {
+		foreach ( array( 'REDIRECT_HTTP_AUTHORIZATION' => 'Bearer x', 'PHP_AUTH_USER' => 'u' ) as $key => $value ) {
+			$this->request( '/shop/v1/list' );
+			$_SERVER[ $key ] = $value;
+			$this->assertNull( $this->state( $this->request( '/shop/v1/list' ) ), $key );
+			unset( $_SERVER[ $key ] );
+		}
+	}
 }
