@@ -227,7 +227,7 @@ final class Cache {
 			if ( ! empty( $_SERVER['HTTP_ORIGIN'] ) ) {
 				return;
 			}
-			$hit = self::lookup_rest( rtrim( substr( $path, strlen( $base ) - 1 ), '/' ), $_GET ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
+			$hit = self::lookup_rest( rtrim( substr( $path, strlen( $base ) - 1 ), '/' ), $_GET, 'GET' === $method ); // phpcs:ignore WordPress.Security.NonceVerification.Recommended
 			if ( null !== $hit ) {
 				self::send_hit( (string) wp_json_encode( $hit['data'] ), 'application/json; charset=UTF-8', $method, $hit['state'], $hit['headers'] );
 			}
@@ -235,7 +235,7 @@ final class Cache {
 		}
 
 		if ( ! self::bypassed( true ) ) {
-			$page = self::lookup_page( $uri );
+			$page = self::lookup_page( $uri, 'GET' === $method );
 			if ( null !== $page && null !== $page['body'] ) {
 				self::send_hit( $page['body'], 'application/json', $method, $page['state'] );
 			}
@@ -262,8 +262,9 @@ final class Cache {
 			parse_str( (string) wp_parse_url( $path, PHP_URL_QUERY ), $params );
 			return is_array( wp_cache_get( self::rest_key( rtrim( substr( $bare, strlen( $base ) - 1 ), '/' ), $params ), self::GROUP ) );
 		}
-		$page = self::lookup_page( $path );
-		return null === $page || is_array( wp_cache_get( $page['key'], self::GROUP ) );
+		// Read only: lookup_page() may take a rebuild lock, and a status check must not.
+		$key = Config::get( 'pages', false ) ? self::page_key( $path ) : null;
+		return null === $key || is_array( wp_cache_get( $key, self::GROUP ) );
 	}
 
 	/**
@@ -272,9 +273,10 @@ final class Cache {
 	 *
 	 * @param string              $route  REST route.
 	 * @param array<string,mixed> $params Query parameters.
+	 * @param bool                $claim  Whether this request would build the answer (a GET). Others are never made to wait for it.
 	 * @return array{data:mixed,headers:array<string,string>,state:string}|null
 	 */
-	public static function lookup_rest( string $route, array $params ): ?array {
+	public static function lookup_rest( string $route, array $params, bool $claim = true ): ?array {
 		if ( ! self::is_cached_route( $route ) || ! self::route_params_allowed( $route, $params ) ) {
 			return null;
 		}
@@ -285,7 +287,7 @@ final class Cache {
 		}
 		$stable = State::stale_generation();
 		$stale  = null === $stable ? null : self::read_rest( self::rest_key( $route, $params, $stable ), 'STALE' );
-		return null !== $stale && ! State::claim_rebuild( $key ) ? $stale : null;
+		return null !== $stale && ( ! $claim || ! State::claim_rebuild( $key ) ) ? $stale : null;
 	}
 
 	/**
@@ -312,9 +314,10 @@ final class Cache {
 	 * null on a miss; a stale body is returned only to requests that did not win the right to rebuild it.
 	 *
 	 * @param string $request_uri Path with any query string.
+	 * @param bool   $claim       Whether this request would build the page (a GET). Others are never made to wait for it.
 	 * @return array{key:string,body:?string,state:string}|null
 	 */
-	public static function lookup_page( string $request_uri ): ?array {
+	public static function lookup_page( string $request_uri, bool $claim = true ): ?array {
 		$identity = Config::get( 'pages', false ) ? self::page_identity( $request_uri ) : null;
 		if ( null === $identity ) {
 			return null;
@@ -329,10 +332,11 @@ final class Cache {
 			);
 		}
 		$stable = State::stale_generation();
-		// A page the change touched is built fresh, never served stale.
-		if ( null !== $stable && ! in_array( (string) strtok( $identity, '?' ), State::fresh( State::generation() ), true ) ) {
+		// A page the change touched is built fresh, never served stale; so is every page when that list is lost.
+		$fresh = null === $stable ? null : State::fresh( State::generation() );
+		if ( null !== $fresh && ! in_array( (string) strtok( $identity, '?' ), $fresh, true ) ) {
 			$body = self::read_page( self::key( 'page', $identity, $stable ) );
-			if ( null !== $body && ! State::claim_rebuild( $key ) ) {
+			if ( null !== $body && ( ! $claim || ! State::claim_rebuild( $key ) ) ) {
 				return array(
 					'key'   => $key,
 					'body'  => $body,
@@ -400,7 +404,7 @@ final class Cache {
 		) {
 			return;
 		}
-		$page = self::lookup_page( self::server( 'REQUEST_URI' ) );
+		$page = self::lookup_page( self::server( 'REQUEST_URI' ), 'GET' === $method );
 		if ( null === $page ) {
 			return;
 		}

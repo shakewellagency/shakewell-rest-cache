@@ -244,4 +244,89 @@ final class StaleTest extends CacheTestCase {
 		$_SERVER['REMOTE_ADDR']                      = '203.0.113.9';
 		$this->assertNotNull( State::stale_generation(), 'and so is the right token from elsewhere' );
 	}
+
+	/**
+	 * Stores a page for a post as a visitor, closes the window as a finished warm does, then has an editor change an option.
+	 *
+	 * @return string The page path.
+	 */
+	private function stored_page_then_changed(): string {
+		$this->set_permalink_structure( '/%postname%/' );
+		add_filter( 'shakewell_rest_cache_pages', '__return_true' );
+		$id   = self::factory()->post->create(
+			array(
+				'post_status' => 'publish',
+				'post_name'   => 'solo',
+			)
+		);
+		$path = (string) wp_parse_url( get_permalink( $id ), PHP_URL_PATH );
+		$_SERVER['REQUEST_URI'] = $path;
+		Cache::serve_page();
+		echo '{"status":200}'; // phpcs:ignore WordPress.Security.EscapeOutput.OutputNotEscaped
+		Cache::store_page( array( 'Content-Type: application/json' ), 200 );
+		ob_end_clean();
+		State::mark_stable( State::generation() );
+		$this->sign_in();
+		update_option( 'blogname', 'Changed' );
+		$this->shutdown();
+		wp_set_current_user( 0 );
+		State::forget_claims();
+		return $path;
+	}
+
+	public function test_a_status_check_or_dry_run_takes_no_rebuild_lock(): void {
+		$path = $this->stored_page_then_changed();
+		$key  = Cache::page_key( $path );
+		$this->assertFalse( Cache::is_warm( $path ), 'the new generation is cold' );
+		\Shakewell\RestCache\Warmer::run( array( 'dry_run' => true ) );
+		$this->assertFalse( wp_cache_get( 'rebuild:' . $key, Cache::GROUP ) );
+		$this->assertNull( Cache::lookup_page( $path )['body'], 'the first real visitor still rebuilds' );
+	}
+
+	public function test_a_head_request_never_takes_the_rebuild_lock(): void {
+		$this->visitor();
+		$path = $this->stored_page_then_changed();
+		$head = Cache::lookup_page( $path, false );
+		$this->assertSame( 'STALE', $head['state'] );
+		$this->assertFalse( wp_cache_get( 'rebuild:' . $head['key'], Cache::GROUP ) );
+		$rest = Cache::lookup_rest( '/shop/v1/list', array(), false );
+		$this->assertSame( 'STALE', $rest['state'] );
+		$this->assertFalse( wp_cache_get( 'rebuild:' . Cache::rest_key( '/shop/v1/list', array() ), Cache::GROUP ) );
+		$this->assertNull( Cache::lookup_page( $path )['body'], 'a GET then rebuilds' );
+	}
+
+	public function test_a_build_that_is_never_stored_gives_the_lock_back_at_shutdown(): void {
+		$path = $this->stored_page_then_changed();
+		$page = Cache::lookup_page( $path );
+		$this->assertNull( $page['body'] );
+		$this->assertNotFalse( wp_cache_get( 'rebuild:' . $page['key'], Cache::GROUP ) );
+		State::release_claims(); // What the shutdown hook runs, when the build ended without storing.
+		$this->assertFalse( wp_cache_get( 'rebuild:' . $page['key'], Cache::GROUP ) );
+		$this->assertNotFalse( has_action( 'shutdown', array( State::class, 'release_claims' ) ) );
+	}
+
+	public function test_a_missing_fresh_list_means_no_page_is_served_stale(): void {
+		$path = $this->stored_page_then_changed();
+		wp_cache_delete( 'fresh:' . State::generation(), Cache::GROUP );
+		$this->assertNull( Cache::lookup_page( $path, false )['body'] );
+		$this->assertNotNull( State::stale_generation(), 'REST can still be served stale' );
+	}
+
+	public function test_a_miss_without_a_stale_copy_does_not_query_the_database(): void {
+		global $wpdb;
+		State::bump( array(), true );
+		$before = $wpdb->num_queries;
+		State::stale_generation();
+		State::stale_generation();
+		$this->assertSame( $before, $wpdb->num_queries );
+		$this->assertNull( State::stable() );
+	}
+
+	public function test_stale_state_survives_the_object_cache_losing_it(): void {
+		$this->stored_then_changed();
+		$stable = State::stable();
+		wp_cache_flush();
+		$this->assertSame( $stable, State::stable() );
+		$this->assertNotNull( State::stale_generation() );
+	}
 }

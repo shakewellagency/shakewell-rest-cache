@@ -24,6 +24,9 @@ final class State {
 		'since'      => 'shakewell_rest_cache_stale_since',
 	);
 
+	/** Stored for a control value that is absent, so reading it never falls through to the database. */
+	const NONE = '0';
+
 	/**
 	 * Keys this request already holds a rebuild lock for, so a second check in the same request does not lose its own lock.
 	 *
@@ -40,6 +43,9 @@ final class State {
 			$generation = wp_generate_uuid4();
 			if ( wp_cache_add( 'generation', $generation, Cache::GROUP ) ) {
 				update_option( self::DURABLE['generation'], $generation, false );
+				// Record "none" now, so a miss never has to ask the database whether there is a stale copy.
+				self::write( 'stable', null );
+				self::write( 'since', null );
 			} else {
 				$generation = (string) wp_cache_get( 'generation', Cache::GROUP, true );
 			}
@@ -86,11 +92,11 @@ final class State {
 				self::write( 'stable', $old );
 				self::write( 'since', (string) time() );
 			}
-			$fresh = array_values( array_unique( array_merge( $open ? self::fresh( $old ) : array(), $paths ) ) );
-			// Before the generation moves, so a request that sees the new one also sees this list.
-			if ( $fresh ) {
-				wp_cache_set( 'fresh:' . $new, $fresh, Cache::GROUP, 2 * HOUR_IN_SECONDS );
-			}
+			$fresh = array_values( array_unique( array_merge( $open ? (array) self::fresh( $old ) : array(), $paths ) ) );
+			// Before the generation moves, so a request that sees the new one also sees this list. Always
+			// written, even empty, and kept past the window: a missing list means "unknown" and nothing is
+			// served stale for a page.
+			wp_cache_set( 'fresh:' . $new, $fresh, Cache::GROUP, self::max_stale() + HOUR_IN_SECONDS );
 		}
 		self::write( 'generation', $new );
 	}
@@ -115,22 +121,22 @@ final class State {
 			return null;
 		}
 		$stable = self::stable();
-		$since  = (int) self::read( 'since' );
-		if ( null === $stable || self::generation() === $stable || $since <= 0 || time() - $since > self::max_stale() ) {
+		if ( null === $stable || self::generation() === $stable ) {
 			return null;
 		}
-		return $stable;
+		$since = (int) self::read( 'since' );
+		return $since > 0 && time() - $since <= self::max_stale() ? $stable : null;
 	}
 
 	/**
 	 * Page paths of $generation that must be built fresh rather than served stale.
 	 *
 	 * @param string $generation Generation.
-	 * @return string[]
+	 * @return string[]|null The paths, or null when the list is missing (evicted or never written).
 	 */
-	public static function fresh( string $generation ): array {
+	public static function fresh( string $generation ): ?array {
 		$fresh = wp_cache_get( 'fresh:' . $generation, Cache::GROUP, true );
-		return is_array( $fresh ) ? $fresh : array();
+		return is_array( $fresh ) ? $fresh : null;
 	}
 
 	/**
@@ -145,6 +151,10 @@ final class State {
 		}
 		$ttl = max( 1, (int) Config::get( 'rebuild_lock', 30 ) );
 		if ( wp_cache_add( 'rebuild:' . $key, 1, Cache::GROUP, $ttl ) ) {
+			if ( ! self::$claimed ) {
+				// A build that is never stored (an error, a cookie, a refusal, a change during the build) must not keep the lock.
+				add_action( 'shutdown', array( self::class, 'release_claims' ), PHP_INT_MAX );
+			}
 			self::$claimed[ $key ] = true;
 			return true;
 		}
@@ -156,6 +166,15 @@ final class State {
 	 */
 	public static function forget_claims(): void {
 		self::$claimed = array();
+	}
+
+	/**
+	 * Gives back every lock this request still holds. Runs at shutdown.
+	 */
+	public static function release_claims(): void {
+		foreach ( array_keys( self::$claimed ) as $key ) {
+			self::release_rebuild( (string) $key );
+		}
 	}
 
 	/**
@@ -199,7 +218,7 @@ final class State {
 	private static function read( string $name ): ?string {
 		$value = wp_cache_get( $name, Cache::GROUP, true );
 		if ( is_string( $value ) && '' !== $value ) {
-			return $value;
+			return self::NONE === $value ? null : $value;
 		}
 		global $wpdb;
 		// phpcs:ignore WordPress.DB.DirectDatabaseQuery.DirectQuery,WordPress.DB.DirectDatabaseQuery.NoCaching -- must bypass the options cache, which is the cache being rebuilt.
@@ -208,21 +227,17 @@ final class State {
 			return null;
 		}
 		wp_cache_add( $name, $durable, Cache::GROUP );
-		return $durable;
+		return self::NONE === $durable ? null : $durable;
 	}
 
 	/**
 	 * Writes a control value to the object cache and its option, or removes both.
 	 *
 	 * @param string      $name  generation, stable or since.
-	 * @param string|null $value Value, or null to remove.
+	 * @param string|null $value Value, or null for none.
 	 */
 	private static function write( string $name, ?string $value ): void {
-		if ( null === $value ) {
-			wp_cache_delete( $name, Cache::GROUP );
-			delete_option( self::DURABLE[ $name ] );
-			return;
-		}
+		$value ??= self::NONE;
 		wp_cache_set( $name, $value, Cache::GROUP );
 		update_option( self::DURABLE[ $name ], $value, false );
 	}
