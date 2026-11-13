@@ -1,5 +1,5 @@
 {
-    "name": "shakewellagency/shakewell-plugin-template",
+    "name": "shakewellagency/shakewell-rest-cache",
     "description": "Starting point for Shakewell WordPress plugins.",
     "type": "wordpress-plugin",
     "license": "GPL-2.0-or-later",

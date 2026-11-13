@@ -4,7 +4,7 @@
  *
  * Runs inside wp-env's tests container, which sets WP_TESTS_DIR (npm test).
  *
- * @package Shakewell\PluginTemplate
+ * @package Shakewell\RestCache
  */
 
 $tests_dir = getenv( 'WP_TESTS_DIR' );
@@ -24,3 +24,5 @@ tests_add_filter(
 );
 
 require $tests_dir . '/includes/bootstrap.php';
+
+require_once __DIR__ . '/Integration/CacheTestCase.php';

@@ -2,10 +2,9 @@
 /**
  * Removes everything the plugin stored when it is deleted from the Plugins screen.
  *
- * @package Shakewell\PluginTemplate
+ * @package Shakewell\RestCache
  */
 
 defined( 'WP_UNINSTALL_PLUGIN' ) || exit;
 
-// Delete this plugin's options, custom tables and scheduled events here.
-// Never delete content editors created unless the plugin's settings say to.
+delete_option( 'shakewell_rest_cache_generation' );
