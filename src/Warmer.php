@@ -41,16 +41,15 @@ final class Warmer {
 				}
 				$ids = get_posts(
 					array(
-						'post_type'        => $type,
-						'post_status'      => 'publish',
-						'posts_per_page'   => -1,
-						'fields'           => 'ids',
-						'orderby'          => array(
+						'post_type'      => $type,
+						'post_status'    => 'publish',
+						'posts_per_page' => -1,
+						'fields'         => 'ids',
+						'orderby'        => array(
 							'menu_order' => 'ASC',
 							'ID'         => 'ASC',
 						),
-						'no_found_rows'    => true,
-						'suppress_filters' => true,
+						'no_found_rows'  => true,
 					)
 				);
 				foreach ( $ids as $id ) {
